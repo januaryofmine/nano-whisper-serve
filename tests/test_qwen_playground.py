@@ -43,3 +43,18 @@ def test_token_for_token(ref, engine):
             f"first mismatch at token {next((i for i in range(n) if got[i] != want[i]), n)}\n"
             f"want[:8]={want[:8]}\n got[:8]={got[:8]}"
         )
+
+
+def test_batched_matches_reference(ref, engine):
+    """MM 1.3: static batching must be a pure throughput change — batched rows equal the
+    single-seq output and the reference token-for-token, and output is independent of batch
+    size (the batch-dim plumbing must not leak across rows)."""
+    qwen, weights, cfg = engine
+    rec = ref["records"][0]
+    pid, want = rec["prompt_ids"], rec["generated_ids"]
+    b2 = qwen.generate_batched(weights, cfg, pid, batch_size=2, max_new_tokens=len(want))
+    b4 = qwen.generate_batched(weights, cfg, pid, batch_size=4, max_new_tokens=len(want))
+    single = qwen.generate(weights, cfg, pid, max_new_tokens=len(want))
+    assert all(r == b2[0] for r in b2), "rows within a batch diverged"
+    assert b2[0] == single == want[: len(b2[0])], "batched != single / reference token-for-token"
+    assert b4[0] == b2[0], "output depends on batch size (should not)"

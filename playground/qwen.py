@@ -217,6 +217,85 @@ def generate(weights: dict, cfg: dict, prompt_ids: list[int], max_new_tokens: in
 
 
 # ---------------------------------------------------------------------------
+# Static batching (MM 1.3) — decode N sequences in one forward/step
+# ---------------------------------------------------------------------------
+class KVCacheBatched:
+    """Batched contiguous KV cache: [n_layers, B, max_len, n_kv_heads, head_dim] + shared int
+    length (uniform lockstep decode -> every row has the same length, no padding needed yet)."""
+
+    def __init__(self, n_layers: int, batch: int, max_len: int, n_kv_heads: int, head_dim: int) -> None:
+        self.k = torch.zeros(n_layers, batch, max_len, n_kv_heads, head_dim)
+        self.v = torch.zeros(n_layers, batch, max_len, n_kv_heads, head_dim)
+        self.length = 0
+
+
+@torch.no_grad()
+def forward_cached_batched(weights: dict, cfg: dict, new_ids: list[list[int]], cache: KVCacheBatched,
+                           cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Batched forward over new tokens (same shape logic as forward_cached, with a leading B dim)."""
+    w = weights
+    ids = torch.as_tensor(new_ids)                   # [B, m]
+    B, m = ids.shape
+    off = cache.length
+    H, HKV, HD = cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
+    eps, rep, scale = cfg["eps"], H // HKV, HD ** -0.5
+    x = w["model.embed_tokens.weight"][ids]          # [B, m, D]
+    qpos = torch.arange(off, off + m)
+    kpos = torch.arange(off + m)
+    mask = torch.where(kpos[None, :] <= qpos[:, None], 0.0, float("-inf"))  # [m, off+m] -> broadcasts over B,H
+    cs = cos[off:off + m].view(1, m, 1, HD)
+    sn = sin[off:off + m].view(1, m, 1, HD)
+
+    for i in range(cfg["n_layers"]):
+        p = f"model.layers.{i}."
+        h = rmsnorm(x, w[p + "input_layernorm.weight"], eps)
+        q = (h @ w[p + "self_attn.q_proj.weight"].T).view(B, m, H, HD)
+        k = (h @ w[p + "self_attn.k_proj.weight"].T).view(B, m, HKV, HD)
+        v = (h @ w[p + "self_attn.v_proj.weight"].T).view(B, m, HKV, HD)
+        q = rmsnorm(q, w[p + "self_attn.q_norm.weight"], eps)
+        k = rmsnorm(k, w[p + "self_attn.k_norm.weight"], eps)
+        q = q * cs + rotate_half(q) * sn
+        k = k * cs + rotate_half(k) * sn
+        cache.k[i, :, off:off + m] = k
+        cache.v[i, :, off:off + m] = v
+        Kf = cache.k[i, :, :off + m].repeat_interleave(rep, dim=2)   # [B, off+m, H, HD]
+        Vf = cache.v[i, :, :off + m].repeat_interleave(rep, dim=2)
+        qh = q.transpose(1, 2)                                       # [B, H, m, HD]
+        scores = (qh @ Kf.transpose(1, 2).transpose(-1, -2)) * scale + mask   # [B, H, m, off+m]
+        attn = torch.softmax(scores, dim=-1)
+        o = (attn @ Vf.transpose(1, 2)).transpose(1, 2).reshape(B, m, H * HD)
+        x = x + o @ w[p + "self_attn.o_proj.weight"].T
+        h = rmsnorm(x, w[p + "post_attention_layernorm.weight"], eps)
+        gate = h @ w[p + "mlp.gate_proj.weight"].T
+        up = h @ w[p + "mlp.up_proj.weight"].T
+        x = x + (torch.nn.functional.silu(gate) * up) @ w[p + "mlp.down_proj.weight"].T
+
+    cache.length = off + m
+    x = rmsnorm(x, w["model.norm.weight"], eps)
+    return x @ w["lm_head.weight"].T                 # [B, m, vocab]
+
+
+@torch.no_grad()
+def generate_batched(weights: dict, cfg: dict, prompt_ids: list[int], batch_size: int,
+                     max_new_tokens: int = 32, max_len: int = 512) -> list[list[int]]:
+    """Static batching: decode `batch_size` copies of the same prompt in lockstep (uniform).
+    Returns B token lists (all identical under greedy — that is the correctness property)."""
+    B = batch_size
+    cache = KVCacheBatched(cfg["n_layers"], B, max_len, cfg["n_kv_heads"], cfg["head_dim"])
+    cos, sin = rope_cos_sin(max_len, cfg["head_dim"], cfg["theta"])
+    logits = forward_cached_batched(weights, cfg, [list(prompt_ids)] * B, cache, cos, sin)  # prefill
+    out: list[list[int]] = [[] for _ in range(B)]
+    for _ in range(max_new_tokens):
+        nxt = logits[:, -1, :].argmax(-1)            # [B]
+        for b in range(B):
+            out[b].append(int(nxt[b]))
+        if int(nxt[0]) == cfg["eos"]:
+            break
+        logits = forward_cached_batched(weights, cfg, nxt.view(B, 1).tolist(), cache, cos, sin)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI: correctness gate (cached must match reference) + naive-vs-cached A/B
 # ---------------------------------------------------------------------------
 def main() -> None:
