@@ -58,18 +58,25 @@ def main() -> None:
         if device == "cuda":
             torch.cuda.synchronize()
 
+    ml = len(prompt_ids) + a.max_new_tokens + 1   # tight cache -> don't preallocate 512 (OOMs at high batch)
     results = []
     for B in batches:
-        qwen.generate_batched(weights, cfg, prompt_ids, B, max_new_tokens=4)   # warmup (untimed)
-        sync()
-        t0 = time.time()
-        qwen.generate_batched(weights, cfg, prompt_ids, B, max_new_tokens=a.max_new_tokens)
-        sync()
-        dt = time.time() - t0
+        try:
+            qwen.generate_batched(weights, cfg, prompt_ids, B, max_new_tokens=4, max_len=ml)   # warmup
+            sync()
+            t0 = time.time()
+            qwen.generate_batched(weights, cfg, prompt_ids, B, max_new_tokens=a.max_new_tokens, max_len=ml)
+            sync()
+            dt = time.time() - t0
+        except RuntimeError as e:   # OOM at high batch -> record where the curve stopped, don't crash
+            print(f"  batch={B:>4}  stopped ({str(e)[:70]})")
+            break
         tps = B * a.max_new_tokens / dt
         results.append({"batch": B, "tok_per_s": round(tps, 2), "elapsed_s": round(dt, 3),
                         "latency_ms_per_step": round(1000 * dt / a.max_new_tokens, 2)})
         print(f"  batch={B:>4}  {tps:8.2f} tok/s   ({dt:.2f}s, {1000*dt/a.max_new_tokens:.1f} ms/step)")
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     payload = {"env": env_meta(device), "max_new_tokens": a.max_new_tokens,
                "prompt_len": len(prompt_ids), "results": results}
