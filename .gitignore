@@ -46,3 +46,12 @@ models/
 .coverage
 htmlcov/
 .env
+.env.*
+
+# Credentials — NEVER commit (defensive; real creds live in ~/.kaggle, outside the repo)
+kaggle.json
+access_token
+.kaggle/
+*.pem
+*.key
+id_rsa*
