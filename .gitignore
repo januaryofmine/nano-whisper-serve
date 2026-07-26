@@ -38,6 +38,10 @@ models/
 # Benchmark scratch (keep committed results under benchmarks/ explicitly)
 *.tmp
 
+# Reference-oracle answer key: commit the tiny JSON (token ids + text), ignore the
+# large tensor dump (mel + encoder) — regenerable via `python -m engine.ref_whisper`
+tests/ref_whisper.npz
+
 # Tooling / OS
 .DS_Store
 .pytest_cache/

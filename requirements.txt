@@ -10,5 +10,10 @@ matplotlib          # B_crit plot (MM 1.3)
 tiktoken            # not used in M1; needed for the Whisper tokenizer in M2
 pytest              # correctness gate + unit tests
 
-# --- Milestone 2+ (audio + serving) will add: soundfile, librosa,
-#     fastapi, uvicorn[standard], websockets, openai-whisper, faster-whisper ---
+# --- Milestone 2: Whisper core (engine/) ---
+soundfile           # read wav fixtures -> float32 (engine audio IO)
+librosa             # build mel filterbank offline + resample fixtures (NOT in inference path)
+openai-whisper      # REFERENCE ORACLE ONLY (engine/ref_whisper.py) — never in the hand-written engine
+datasets            # source FLEURS fixtures (tests/fixtures/make_fixtures.py) — dev-time only
+
+# --- Milestone 3+ (serving) will add: fastapi, uvicorn[standard], websockets, faster-whisper ---
