@@ -8,6 +8,7 @@ safetensors         # load Qwen weights
 huggingface_hub     # download weights (huggingface-cli / hf)
 matplotlib          # B_crit plot (MM 1.3)
 tiktoken            # not used in M1; needed for the Whisper tokenizer in M2
+pytest              # correctness gate + unit tests
 
 # --- Milestone 2+ (audio + serving) will add: soundfile, librosa,
 #     fastapi, uvicorn[standard], websockets, openai-whisper, faster-whisper ---
