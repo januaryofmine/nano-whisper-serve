@@ -1,0 +1,13 @@
+# nano-whisper-serve — dependencies (grows per milestone)
+
+# --- Milestone 1: Qwen text engine (playground) ---
+torch>=2.2
+numpy
+transformers        # REFERENCE ORACLE ONLY (ref_hf.py) — never in the hand-written engine
+safetensors         # load Qwen weights
+huggingface_hub     # download weights (huggingface-cli / hf)
+matplotlib          # B_crit plot (MM 1.3)
+tiktoken            # not used in M1; needed for the Whisper tokenizer in M2
+
+# --- Milestone 2+ (audio + serving) will add: soundfile, librosa,
+#     fastapi, uvicorn[standard], websockets, openai-whisper, faster-whisper ---

@@ -1,0 +1,48 @@
+# Working notes / research artifacts (deep-read-repo output lives here)
+local/
+.claude/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Model weights / large downloads (weights are downloaded, never committed — see CLAUDE.md §4)
+*.pt
+*.bin
+*.safetensors
+*.onnx
+weights/
+models/
+
+# Audio — ignore everywhere EXCEPT the known-good correctness fixtures
+*.wav
+*.flac
+*.mp3
+!tests/fixtures/audio/
+!tests/fixtures/audio/*.wav
+!tests/fixtures/audio/*.flac
+!tests/fixtures/audio/*.mp3
+
+# Benchmark scratch (keep committed results under benchmarks/ explicitly)
+*.tmp
+
+# Tooling / OS
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.env
