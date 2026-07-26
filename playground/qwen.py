@@ -1,14 +1,16 @@
 """
-qwen.py — MM 1.1: hand-written Qwen3-0.6B text engine (naive, NO KV cache).
+qwen.py — hand-written Qwen3-0.6B text engine.
 
-Plain PyTorch. Each greedy step re-runs the WHOLE sequence through the 28 decoder
-layers (O(n^2) work) — that's the point: this is the floor. The KV cache (MM 1.2)
-removes the prefix recompute. Runs fp32 on CPU so it matches the HF reference
-(playground/ref_qwen.json) token-for-token.
+Plain PyTorch, fp32 on CPU so it matches the HF reference (playground/ref_qwen.json)
+token-for-token.
+  - MM 1.1 (v0.0): generate_naive — re-runs the WHOLE sequence each step (O(n^2)); the floor.
+  - MM 1.2 (v0.1): generate + KVCache — prefill once, then one new token/step; contiguous
+    self-attention cache (NOT paged). Same output as naive; the cache is a pure speedup.
 
 API:
     weights, cfg = load("models/qwen3-0.6b")
-    ids = generate(weights, cfg, prompt_ids, max_new_tokens=32)   # -> list[int] (generated only)
+    ids = generate(weights, cfg, prompt_ids, max_new_tokens=32)        # cached (default)
+    ids = generate_naive(weights, cfg, prompt_ids, max_new_tokens=32)  # v0.0 baseline
 """
 import json
 import sys
@@ -121,10 +123,10 @@ def forward(weights, cfg, ids):
 
 
 @torch.no_grad()
-def generate(weights, cfg, prompt_ids, max_new_tokens=32):
-    """Greedy decode. NO cache -> re-runs the full sequence every step."""
+def generate_naive(weights: dict, cfg: dict, prompt_ids: list[int], max_new_tokens: int = 32) -> list[int]:
+    """v0.0 baseline: greedy, NO cache -> re-runs the full sequence every step (O(n^2))."""
     ids = list(prompt_ids)
-    out = []
+    out: list[int] = []
     for _ in range(max_new_tokens):
         logits = forward(weights, cfg, ids)      # [T, vocab]
         nxt = int(logits[-1].argmax())           # greedy = argmax over the last position
@@ -136,13 +138,92 @@ def generate(weights, cfg, prompt_ids, max_new_tokens=32):
 
 
 # ---------------------------------------------------------------------------
-# CLI: compare against the reference answer key + print baseline tok/s
+# KV cache (MM 1.2) — the main learning objective
 # ---------------------------------------------------------------------------
-def main():
+class KVCache:
+    """Contiguous per-layer self-attention cache. Preallocated; grows by an int `length`.
+    NOT paged (no block table) — Qwen/Whisper sequences are short (CLAUDE.md §4).
+    Stores post-QK-norm/post-RoPE keys and raw values, so attention reads them directly."""
+
+    def __init__(self, n_layers: int, max_len: int, n_kv_heads: int, head_dim: int) -> None:
+        self.k = torch.zeros(n_layers, max_len, n_kv_heads, head_dim)
+        self.v = torch.zeros(n_layers, max_len, n_kv_heads, head_dim)
+        self.length = 0   # how many positions are filled (the write offset)
+
+
+@torch.no_grad()
+def forward_cached(weights: dict, cfg: dict, new_ids: list[int], cache: KVCache,
+                   cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Forward only the NEW tokens, using + growing `cache`. One code path serves both
+    prefill (new_ids = whole prompt, cache empty) and decode (new_ids = [one token])."""
+    w = weights
+    m = len(new_ids)
+    off = cache.length                               # positional offset = current cache length
+    H, HKV, HD = cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
+    eps, rep, scale = cfg["eps"], H // HKV, HD ** -0.5
+    x = w["model.embed_tokens.weight"][torch.as_tensor(new_ids)]      # [m, 1024]
+    # causal mask SHIFTED by off: new query i (abs pos off+i) may see keys 0..off+i
+    qpos = torch.arange(off, off + m)
+    kpos = torch.arange(off + m)
+    mask = torch.where(kpos[None, :] <= qpos[:, None], 0.0, float("-inf"))  # [m, off+m]
+    cs, sn = cos[off:off + m], sin[off:off + m]                      # RoPE at absolute positions
+
+    for i in range(cfg["n_layers"]):
+        p = f"model.layers.{i}."
+        h = rmsnorm(x, w[p + "input_layernorm.weight"], eps)
+        q = (h @ w[p + "self_attn.q_proj.weight"].T).view(m, H, HD)
+        k = (h @ w[p + "self_attn.k_proj.weight"].T).view(m, HKV, HD)
+        v = (h @ w[p + "self_attn.v_proj.weight"].T).view(m, HKV, HD)
+        q = rmsnorm(q, w[p + "self_attn.q_norm.weight"], eps)
+        k = rmsnorm(k, w[p + "self_attn.k_norm.weight"], eps)
+        q = apply_rope(q, cs, sn)
+        k = apply_rope(k, cs, sn)
+        cache.k[i, off:off + m] = k                  # write post-norm/post-RoPE keys + raw values
+        cache.v[i, off:off + m] = v
+        Kf = cache.k[i, :off + m].repeat_interleave(rep, dim=1)   # [off+m, H, HD]  (GQA expand)
+        Vf = cache.v[i, :off + m].repeat_interleave(rep, dim=1)
+        qh = q.transpose(0, 1)                                    # [H, m, HD]
+        scores = (qh @ Kf.transpose(0, 1).transpose(-1, -2)) * scale + mask   # [H, m, off+m]
+        attn = torch.softmax(scores, dim=-1)
+        o = (attn @ Vf.transpose(0, 1)).transpose(0, 1).reshape(m, H * HD)
+        x = x + o @ w[p + "self_attn.o_proj.weight"].T
+        h = rmsnorm(x, w[p + "post_attention_layernorm.weight"], eps)
+        gate = h @ w[p + "mlp.gate_proj.weight"].T
+        up = h @ w[p + "mlp.up_proj.weight"].T
+        x = x + (torch.nn.functional.silu(gate) * up) @ w[p + "mlp.down_proj.weight"].T
+
+    cache.length = off + m                           # grow the cache
+    x = rmsnorm(x, w["model.norm.weight"], eps)
+    return x @ w["lm_head.weight"].T                 # [m, vocab]
+
+
+@torch.no_grad()
+def generate(weights: dict, cfg: dict, prompt_ids: list[int], max_new_tokens: int = 32,
+             max_len: int = 512) -> list[int]:
+    """Greedy decode WITH a contiguous KV cache: prefill the prompt once, then feed ONE
+    new token per step (no prefix recompute). Output is identical to generate_naive."""
+    HKV, HD = cfg["n_kv_heads"], cfg["head_dim"]
+    cache = KVCache(cfg["n_layers"], max_len, HKV, HD)
+    cos, sin = rope_cos_sin(max_len, HD, cfg["theta"])
+    logits = forward_cached(weights, cfg, list(prompt_ids), cache, cos, sin)  # prefill
+    out: list[int] = []
+    for _ in range(max_new_tokens):
+        nxt = int(logits[-1].argmax())
+        out.append(nxt)
+        if nxt == cfg["eos"]:
+            break
+        logits = forward_cached(weights, cfg, [nxt], cache, cos, sin)         # decode 1 token
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CLI: correctness gate (cached must match reference) + naive-vs-cached A/B
+# ---------------------------------------------------------------------------
+def main() -> None:
     root = Path(__file__).resolve().parent.parent
     weights, cfg = load(root / "models" / "qwen3-0.6b")
     ref = json.loads((root / "playground" / "ref_qwen.json").read_text())
-    torch.manual_seed(0)
+
     total_toks, total_time, all_match = 0, 0.0, True
     for rec in ref["records"]:
         want = rec["generated_ids"]
@@ -154,10 +235,17 @@ def main():
         all_match &= match
         total_toks += len(got)
         total_time += dt
-        mark = "✅" if match else "❌"
-        print(f"{mark} {rec['prompt']!r}: {len(got)} toks in {dt:.1f}s"
+        print(f"{'✅' if match else '❌'} {rec['prompt']!r}: {len(got)} toks in {dt:.1f}s"
               + ("" if match else f"  first-mismatch@{next((i for i in range(n) if got[i]!=want[i]), n)}"))
-    print(f"\n{'ALL MATCH ✅' if all_match else 'MISMATCH ❌'} | baseline {total_toks/total_time:.2f} tok/s (fp32 CPU, no cache)")
+    print(f"\n{'ALL MATCH ✅' if all_match else 'MISMATCH ❌'} | +KV cache: {total_toks/total_time:.2f} tok/s (fp32 CPU)")
+
+    # same-session A/B (1 prompt) -> the before->after number
+    rec = ref["records"][0]
+    pid, nnew = rec["prompt_ids"], len(rec["generated_ids"])
+    t = time.time(); a = generate_naive(weights, cfg, pid, nnew); naive_dt = time.time() - t
+    t = time.time(); b = generate(weights, cfg, pid, nnew); cached_dt = time.time() - t
+    print(f"A/B ({nnew} toks): naive {nnew/naive_dt:.2f} tok/s  →  cached {nnew/cached_dt:.2f} tok/s"
+          f"  ({naive_dt/cached_dt:.1f}x) | same output: {a == b}")
 
 
 if __name__ == "__main__":
