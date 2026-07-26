@@ -1,0 +1,69 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "python": "3.12.13",
+    "platform": "Linux-6.12.90+-x86_64-with-glibc2.35",
+    "device": "cuda",
+    "gpu": "Tesla P100-PCIE-16GB",
+    "vram_gb": 17.1,
+    "cuda": "12.1"
+  },
+  "max_new_tokens": 64,
+  "prompt_len": 5,
+  "results": [
+    {
+      "batch": 1,
+      "tok_per_s": 27.4,
+      "elapsed_s": 2.336,
+      "latency_ms_per_step": 36.5
+    },
+    {
+      "batch": 2,
+      "tok_per_s": 55.76,
+      "elapsed_s": 2.296,
+      "latency_ms_per_step": 35.87
+    },
+    {
+      "batch": 4,
+      "tok_per_s": 111.32,
+      "elapsed_s": 2.3,
+      "latency_ms_per_step": 35.93
+    },
+    {
+      "batch": 8,
+      "tok_per_s": 217.27,
+      "elapsed_s": 2.357,
+      "latency_ms_per_step": 36.82
+    },
+    {
+      "batch": 16,
+      "tok_per_s": 430.53,
+      "elapsed_s": 2.378,
+      "latency_ms_per_step": 37.16
+    },
+    {
+      "batch": 32,
+      "tok_per_s": 850.04,
+      "elapsed_s": 2.409,
+      "latency_ms_per_step": 37.65
+    },
+    {
+      "batch": 64,
+      "tok_per_s": 1495.68,
+      "elapsed_s": 2.739,
+      "latency_ms_per_step": 42.79
+    },
+    {
+      "batch": 128,
+      "tok_per_s": 1949.37,
+      "elapsed_s": 4.202,
+      "latency_ms_per_step": 65.66
+    },
+    {
+      "batch": 256,
+      "tok_per_s": 2095.02,
+      "elapsed_s": 7.82,
+      "latency_ms_per_step": 122.19
+    }
+  ]
+}
