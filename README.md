@@ -14,7 +14,7 @@ explainable* engine where each speedup is one commit + one measured number.
 | Milestone | What | State |
 |---|---|---|
 | **M1 — Qwen text engine** (`playground/`) | hand-written Qwen3-0.6B forward + greedy + KV cache + static batching | ✅ done |
-| M2 — Whisper core (`engine/`) | mel → encoder (once) → decode loop with two caches (static cross-attn + growing self-attn) | planned |
+| M2 — Whisper core (`engine/`) | mel → encoder (once) → decode loop with two caches (static cross-attn + growing self-attn) | ✅ done |
 | M3 — Serving engine (`serving/`) | continuous batching over N concurrent audio streams; RTF + throughput benchmarks | planned |
 | M4 — Streaming shell (`demo/`) | WebSocket, partial transcripts, LocalAgreement token locking | planned (bonus) |
 
@@ -52,16 +52,66 @@ the matmuls have become **compute-bound**. That knee is `B_crit`
 (≈ peak_FLOP / peak_bandwidth for the GPU). Raw numbers + GPU metadata:
 [`benchmarks/qwen_tokens_per_sec_vs_batch.json`](benchmarks/qwen_tokens_per_sec_vs_batch.json).
 
+## Milestone 2 results — Whisper-small, plain PyTorch
+
+The engine transcribes audio end-to-end — log-mel → encoder (run once) → greedy decode with two KV
+caches — all hand-written. It reproduces `openai/whisper` (small, greedy, `without_timestamps`)
+**token-for-token** on both a Vietnamese and an English clip.
+
+**Correctness is gated in layers** against a reference oracle (`engine/ref_whisper.py` dumps
+`openai/whisper`'s own mel, encoder output, and token stream as the answer key). Each layer must match
+before the next is trusted:
+
+| Layer | Check | Result |
+|---|---|---|
+| mel front-end | `max\|Δ\|` vs `whisper.log_mel_spectrogram` | **0.0** (bit-exact) |
+| encoder output | `max\|Δ\|` vs `whisper` encoder | **0.0** (bit-exact) |
+| transcript | token-for-token vs `whisper` greedy | **exact** (VN + EN, + 8 diverse/edge clips) |
+
+**Optimization story** (each = one commit + one number):
+
+| Step | Change | Number | Roofline explanation |
+|---|---|---|---|
+| v0.2 | naive greedy decode, **no cache** | ~14 tok/s (CPU) | recomputes the whole token prefix every step **and** re-projects cross-attention K/V from all 1500 encoder frames × 12 layers each step |
+| v0.2 | **+ two KV caches** | **~2.2×** (CPU, identical output) | self-attention K/V grow one row per step; cross-attention K/V are computed **once** from the static encoder output and reused — decode stays memory-bound (arithmetic intensity ≈ 1), the caches just remove the redundant recompute |
+
+### self-attention cache vs cross-attention cache
+
+Whisper is encoder–decoder, so the decoder carries **two** attention caches that behave differently:
+
+- **Self-attention cache** — identical to a decoder-only LLM (Milestone 1): it holds the K/V of the tokens
+  generated so far and **grows by one entry per step** (`torch.cat` on the sequence axis). The new token's
+  positional offset is the current cached length.
+- **Cross-attention cache** — the decoder attends to the encoder output, which is **fixed for the whole
+  30-second segment**. So its K/V are projected **once** on the first decode pass and reused unchanged for
+  every later token — "prefill in disguise". The naive path re-reads 1500 encoder frames through 12 layers
+  every step for nothing.
+
+That second cache is the only structural addition over the Milestone-1 text decoder — the greedy loop, the
+growing self-attention cache, and the attention/LayerNorm blocks all port directly.
+
+### Design notes / non-goals (Milestone 2)
+
+Greedy decoding only; one 30-second segment; language passed explicitly (no auto-detection). No word-level
+timestamps (decoded with `<|notimestamps|>`), no beam search, no temperature fallback — deliberately out of
+scope. The tokenizer is built on `tiktoken` alone: the engine never imports `openai-whisper`, which is used
+only as the test-time reference oracle.
+
 ## Run it
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 huggingface-cli download Qwen/Qwen3-0.6B --local-dir models/qwen3-0.6b
 
-# generate + correctness check (matches the HF reference token-for-token) + naive-vs-cached A/B
+# M1: generate + correctness check (matches the HF reference token-for-token) + naive-vs-cached A/B
 .venv/bin/python playground/qwen.py
 
-# correctness gate (single-seq + batched)
+# M2: download Whisper-small, create the VN/EN fixtures, build the reference answer key
+.venv/bin/python -c "import whisper; whisper.load_model('small', download_root='models/whisper-small')"
+.venv/bin/python tests/fixtures/make_fixtures.py
+.venv/bin/python -m engine.ref_whisper
+
+# correctness gate (M1 token-for-token + batched; M2 mel/encoder bit-exact + transcript token-for-token)
 .venv/bin/python -m pytest tests/ -q
 
 # throughput sweep -> the B_crit curve (use a GPU for a representative curve)
