@@ -60,11 +60,15 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, xa=None, mask=None, kv_cache=None):
         q = self.query(x)
         if kv_cache is None:
-            # self-attn (xa is None) or cross-attn (xa is the encoder output), recomputed each call
+            # naive: recompute k,v every call — self-attn (xa None) or cross-attn (xa = encoder output)
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
+        elif xa is None:
+            # self-attn: project the NEW tokens' k,v and grow the cache (torch.cat dim=1)
+            k, v = kv_cache.grow_self(id(self), self.key(x), self.value(x))
         else:
-            raise NotImplementedError("MM 2.4: kv_cache path (self grows, cross static)")
+            # cross-attn: project k,v from the encoder output ONCE, then reuse (static)
+            k, v = kv_cache.get_or_compute_cross(id(self), lambda: (self.key(xa), self.value(xa)))
         return self.out(self._qkv_attention(q, k, v, mask))
 
     def _qkv_attention(self, q, k, v, mask=None):
