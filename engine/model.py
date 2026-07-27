@@ -121,8 +121,28 @@ class AudioEncoder(nn.Module):
 
 
 class TextDecoder(nn.Module):
-    def forward(self, tokens, xa, kv_cache=None):
-        raise NotImplementedError("MM 2.3")
+    """token emb + learned pos + N blocks (self-attn causal + cross-attn to encoder) + ln + tied output."""
+
+    def __init__(self, n_vocab, n_ctx, n_state, n_head, n_layer):
+        super().__init__()
+        self.token_embedding = nn.Embedding(n_vocab, n_state)
+        self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))  # LEARNED (vs sinusoidal enc)
+        self.blocks = nn.ModuleList(
+            ResidualAttentionBlock(n_state, n_head, cross_attention=True) for _ in range(n_layer)
+        )
+        self.ln = LayerNorm(n_state)
+        mask = torch.empty(n_ctx, n_ctx).fill_(float("-inf")).triu_(1)  # strict-upper -inf (causal)
+        self.register_buffer("mask", mask, persistent=False)            # not in state_dict
+
+    def forward(self, tokens: torch.Tensor, xa: torch.Tensor, kv_cache=None) -> torch.Tensor:
+        # offset = number of already-cached self-attn positions (0 when cache OFF / prefill). MM 2.4 fills it.
+        offset = 0 if kv_cache is None else kv_cache.self_len(id(self.blocks[0].attn))
+        x = self.token_embedding(tokens) + self.positional_embedding[offset:offset + tokens.shape[-1]]
+        x = x.to(xa.dtype)
+        for block in self.blocks:
+            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)  # self-attn causal; cross-attn to xa
+        x = self.ln(x)
+        return (x @ self.token_embedding.weight.T).float()      # tied output; logits in fp32
 
 
 class Whisper(nn.Module):
@@ -131,7 +151,8 @@ class Whisper(nn.Module):
         self.dims = dims
         self.encoder = AudioEncoder(dims.n_mels, dims.n_audio_ctx, dims.n_audio_state,
                                     dims.n_audio_head, dims.n_audio_layer)
-        self.decoder = None  # MM 2.3
+        self.decoder = TextDecoder(dims.n_vocab, dims.n_text_ctx, dims.n_text_state,
+                                   dims.n_text_head, dims.n_text_layer)
 
     @property
     def is_multilingual(self) -> bool:
@@ -143,11 +164,9 @@ class Whisper(nn.Module):
 
 
 def load_whisper_small(model_dir: str) -> Whisper:
-    """Load the whisper-small checkpoint into hand-written modules (encoder now; decoder MM 2.3)."""
+    """Load the whisper-small checkpoint into hand-written modules (encoder + decoder)."""
     ckpt = torch.load(Path(model_dir) / "small.pt", map_location="cpu")
     m = Whisper(WhisperDims(**ckpt["dims"]))
-    sd = ckpt["model_state_dict"]
-    enc_sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
-    m.encoder.load_state_dict(enc_sd, strict=True)  # strict=True == name-map proof
+    m.load_state_dict(ckpt["model_state_dict"], strict=True)  # strict=True == full name-map proof
     m.eval()
     return m
